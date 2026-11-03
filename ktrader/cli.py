@@ -5,6 +5,7 @@
   python -m ktrader backtest --start 20200101 --end 20261030 --strategy momentum
   python -m ktrader demo-global              # 국내·미국·일본·홍콩 통합 시연(합성 데이터)
   python -m ktrader backtest --start 20220103 --end 20261030 --strategy momentum --symbols 005930,AAPL,MSFT,7203.T
+  python -m ktrader check --mode mock        # 증권사 서버 연결 점검(읽기 전용)
   python -m ktrader trade --mode mock        # 한국투자증권 모의투자 서버로 1회 사이클 실행(해외 종목 자동 라우팅)
 """
 from __future__ import annotations
@@ -239,10 +240,29 @@ def cmd_screen(args, cfg: AppConfig) -> int:
     from .data.collector import MarketDataCollector
 
     col = MarketDataCollector(cfg.data_dir)
+    # 기준일: 지정하지 않으면 '오늘 이전' 가장 최근 거래일. 주말·휴장일이면 데이터가 있는 날까지 거슬러 올라감
+    from .krx import now_kst
+
+    day = pd.Timestamp(args.date) if args.date else pd.Timestamp(now_kst().date()) - pd.Timedelta(days=1)
+    f = pd.DataFrame()
+    for _ in range(10):
+        if day.weekday() < 5:
+            try:
+                f = col.get_fundamentals(day.strftime("%Y%m%d"), args.market)
+            except Exception as e:
+                log.warning("%s 데이터 조회 실패: %s", day.date(), e)
+            if f is not None and not f.empty:
+                break
+        day -= pd.Timedelta(days=1)
+    if f is None or f.empty:
+        print("최근 10일 내 거래일 데이터를 찾지 못했습니다(데이터 소스 상태를 확인하십시오).")
+        return 2
+    args.date = day.strftime("%Y%m%d")
+    print(f"기준일: {day.date()} ({args.market})")
     tickers = col.get_tickers(args.date, args.market)["ticker"].tolist()[: args.limit]
-    start = (pd.Timestamp(args.date) - pd.Timedelta(days=420)).strftime("%Y%m%d")
+    start = (day - pd.Timedelta(days=420)).strftime("%Y%m%d")
     panel = col.get_ohlcv_panel(tickers, start, args.date)
-    f = col.get_fundamentals(args.date, args.market).reindex(tickers)
+    f = f.reindex(tickers)
     asof = panel["close"].index[-1]
     fund = {k: pd.DataFrame([f[k]], index=[asof]) for k in ("PER", "PBR") if k in f}
     if {"EPS", "BPS"} <= set(f.columns):
@@ -252,6 +272,13 @@ def cmd_screen(args, cfg: AppConfig) -> int:
     print(explain_exclusions(res.excluded))
     for t, row in res.top(args.top).iterrows():
         print(explain_recommendation(t, row, "", len(res.scores), table.loc[t]))
+    if args.out:
+        top = res.top(args.top)
+        weight = round(min(args.weight, 1.0 / max(len(top), 1)), 4)
+        pd.DataFrame({"ticker": top.index, "weight": weight,
+                      "reason": [f"멀티팩터 {int(r['rank'])}위(점수 {r['composite']:+.2f}, {args.date})" for _, r in top.iterrows()]}
+                     ).to_csv(args.out, index=False, encoding="utf-8")
+        print(f"목표 비중 파일 저장: {args.out} ({len(top)}종목 × {weight:.1%}) → trade --targets {args.out}")
     print(DISCLAIMER)
     return 0
 
@@ -282,6 +309,37 @@ def cmd_backtest(args, cfg: AppConfig) -> int:
     return 0
 
 
+def cmd_check(args, cfg: AppConfig) -> int:
+    """증권사 서버 연결 점검(읽기 전용). 주문은 보내지 않는다."""
+    from .connect import connection_check, print_report
+
+    is_mock = args.mode == "mock"
+    kis = KISConfig.from_env(is_mock=is_mock)
+    results = connection_check(kis, args.kr_symbol, None if args.no_overseas else args.overseas_symbol)
+    return 0 if print_report(results, is_mock) else 1
+
+
+def load_targets(path: str) -> pd.DataFrame:
+    """목표 비중 CSV 검증 후 로드: ticker 형식, 비중 0~1, 합계 ≤ 1, 중복 없음."""
+    from .markets import parse_symbol
+
+    df = pd.read_csv(path, dtype={"ticker": str})
+    if not {"ticker", "weight"} <= set(df.columns):
+        raise ValueError("목표 CSV에는 ticker, weight 열이 필요합니다.")
+    df["ticker"] = df["ticker"].str.strip()
+    if df["ticker"].duplicated().any():
+        raise ValueError(f"중복 종목: {df.loc[df['ticker'].duplicated(), 'ticker'].tolist()}")
+    for t in df["ticker"]:
+        parse_symbol(t)   # 형식 오류 시 ValueError
+    w = pd.to_numeric(df["weight"], errors="coerce")
+    if w.isna().any() or (w < 0).any() or (w > 1).any():
+        raise ValueError("weight는 0~1 사이 숫자여야 합니다(예: 0.08 = 8%).")
+    if w.sum() > 1.0 + 1e-9:
+        raise ValueError(f"비중 합계 {w.sum():.2%} > 100% (미수·레버리지 금지)")
+    df["weight"] = w
+    return df.set_index("ticker")
+
+
 def cmd_trade(args, cfg: AppConfig) -> int:
     mode = TradingMode(args.mode)
     assert_mode_allowed(mode)
@@ -293,8 +351,8 @@ def cmd_trade(args, cfg: AppConfig) -> int:
     from .broker.router import RoutingBroker
     from .markets import parse_symbol
 
-    targets = pd.read_csv(args.targets, dtype={"ticker": str}).set_index("ticker")
-    markets = {parse_symbol(t).market for t in targets.index}   # 형식 오류 종목은 여기서 즉시 중단
+    targets = load_targets(args.targets)
+    markets = {parse_symbol(t).market for t in targets.index}
     kis_cfg = KISConfig.from_env(is_mock=(mode == TradingMode.MOCK))
     routes = {"KR": KISBroker(kis_cfg, cfg.cost)}
     if markets - {"KR"}:
@@ -309,8 +367,22 @@ def cmd_trade(args, cfg: AppConfig) -> int:
     ledger = Ledger(cfg.db_path)
     risk = RiskManager(cfg.risk)
 
+    state = {"mtime": os.path.getmtime(args.targets), "targets": targets}
+
     def target_fn(_acct):
-        return targets["weight"], targets.get("reason", pd.Series("목표 비중", index=targets.index)).to_dict()
+        # 목표 파일이 바뀌면(예: 매일 아침 screen --out 실행) 다음 사이클부터 새 목표 적용.
+        # 새 파일이 잘못되었으면 기존 목표를 유지하고 경고만 남긴다.
+        m = os.path.getmtime(args.targets)
+        if m != state["mtime"]:
+            try:
+                new = load_targets(args.targets)
+                state.update(mtime=m, targets=new)
+                log.warning("목표 비중 파일 갱신 반영: %d종목", len(new))
+            except Exception as e:
+                log.error("목표 비중 파일 오류 → 기존 목표 유지: %s", e)
+                state["mtime"] = m
+        t = state["targets"]
+        return t["weight"], t.get("reason", pd.Series("목표 비중", index=t.index)).to_dict()
 
     eng = TradingEngine(broker, risk, ledger, target_fn)
     eng.bootstrap_from_account(broker.get_account())
@@ -334,10 +406,12 @@ def main(argv=None) -> int:
     g.add_argument("--per-market", type=int, default=12)
     g.add_argument("--seed", type=int, default=11)
     s = sub.add_parser("screen")
-    s.add_argument("--date", required=True)
+    s.add_argument("--date", default="", help="기준일 YYYYMMDD(생략 시 가장 최근 거래일)")
     s.add_argument("--market", default="KOSPI")
     s.add_argument("--limit", type=int, default=200)
     s.add_argument("--top", type=int, default=10)
+    s.add_argument("--out", default="", help="추천 결과를 목표 비중 CSV(ticker,weight,reason)로 저장")
+    s.add_argument("--weight", type=float, default=0.08, help="종목당 목표 비중(기본 8%%)")
     b = sub.add_parser("backtest")
     b.add_argument("--start", required=True)
     b.add_argument("--end", required=True)
@@ -345,6 +419,11 @@ def main(argv=None) -> int:
     b.add_argument("--limit", type=int, default=200)
     b.add_argument("--strategy", choices=list(STRATEGIES), default="momentum")
     b.add_argument("--symbols", default="", help="국내·해외 혼합 종목(쉼표 구분): 005930,AAPL,7203.T,0700.HK")
+    c = sub.add_parser("check", help="증권사 서버 연결 점검(읽기 전용, 주문 없음)")
+    c.add_argument("--mode", choices=["mock", "real"], default="mock")
+    c.add_argument("--kr-symbol", default="005930")
+    c.add_argument("--overseas-symbol", default="AAPL")
+    c.add_argument("--no-overseas", action="store_true", help="해외주식 점검 생략")
     t = sub.add_parser("trade")
     t.add_argument("--mode", choices=[m.value for m in TradingMode], default="mock")
     t.add_argument("--targets", required=True, help="CSV: ticker,weight,reason (ticker 예: 005930, AAPL, 7203.T, 0700.HK)")
@@ -353,7 +432,7 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     cfg = AppConfig.from_env()
     logging.getLogger().setLevel(logging.WARNING if args.cmd.startswith("demo") else logging.INFO)
-    return {"demo": cmd_demo, "demo-global": cmd_demo_global, "screen": cmd_screen, "backtest": cmd_backtest, "trade": cmd_trade}[args.cmd](args, cfg)
+    return {"demo": cmd_demo, "demo-global": cmd_demo_global, "check": cmd_check, "screen": cmd_screen, "backtest": cmd_backtest, "trade": cmd_trade}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

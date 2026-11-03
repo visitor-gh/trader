@@ -3,6 +3,7 @@
 KOSPI·KOSDAQ과 미국·일본·홍콩 종목의 **데이터 수집 → 품질 검증 → 팩터 분석·추천 → 백테스트 → 리스크 관리 → 자동 주문(한국투자증권 Open API) → 거래 기록·설명 리포트**까지 하나의 파이프라인으로 구현한 파이썬 패키지입니다.
 
 - 전체 설계서: [`docs/DESIGN.md`](docs/DESIGN.md) (시스템 구조도, 단계별 절차·함수 명세, 리스크·보안·준법)
+- **증권사 서버 연동·운영 가이드: [`docs/CONNECT.md`](docs/CONNECT.md)** (키 발급 → 연결 점검 → 모의 주문 → 상시 운영 → 실전 전환)
 - 해외 확장 설계서: [`docs/GLOBAL.md`](docs/GLOBAL.md) (시장 규칙, 환율, 해외 API, 다중 통화 리스크, 해외주식 양도세)
 - 네트워크 없이 바로 확인: `python -m ktrader demo` (국내), `python -m ktrader demo-global` (국내+미국·일본·홍콩)
 
@@ -44,6 +45,12 @@ python -m ktrader backtest --start 20200102 --end 20261030 --strategy momentum
 
 ```bash
 python -m ktrader backtest --start 20220103 --end 20261030 --strategy momentum --symbols 005930,000660,AAPL,MSFT,7203.T,0700.HK
+```
+
+먼저 주문 없이 연결만 점검합니다(키·계좌·네트워크·해외주식 신청 상태 확인):
+
+```bash
+python -m ktrader check --mode mock
 ```
 
 한국투자증권 **모의투자** 서버로 목표 비중 CSV(`ticker,weight,reason`)를 1회 집행(해외 종목은 해외주식 API로 자동 라우팅, 지금 정규장인 시장의 종목만 주문):
