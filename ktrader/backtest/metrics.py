@@ -112,3 +112,41 @@ def format_metrics(m: dict) -> pd.DataFrame:
 def monthly_returns(equity: pd.Series) -> pd.DataFrame:
     m = equity.resample("ME").last().pct_change().dropna()
     return m.groupby([m.index.year, m.index.month]).first().unstack()
+
+
+def pnl_attribution(result, panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """시장별 손익 기여도(원화)를 '주가 효과'와 '환율 효과'로 분해.
+
+    보유수량 q(t-1)에 대해
+      주가효과 = q × (P_t − P_{t−1}) × FX_{t−1}
+      환율효과 = q × P_t × (FX_t − FX_{t−1})
+    체결일 장중 손익과 비용은 포함하지 않는 근사치이며, 차이는 '거래·비용 등'으로 표시한다.
+    """
+    from ..markets import parse_symbol
+
+    pos = result.positions
+    if pos.empty:
+        return pd.DataFrame()
+    cols = pos.columns
+    idx = pos.index
+    px = panel["close"].ffill().reindex(idx)[cols]
+    fx = panel["fx"].ffill().reindex(idx)[cols] if "fx" in panel else pd.DataFrame(1.0, index=idx, columns=cols)
+    q = pos.shift(1).fillna(0)
+    local = q * px.diff() * fx.shift(1)
+    fxe = q * px * fx.diff()
+
+    def mkt(t):
+        try:
+            return parse_symbol(t).market
+        except ValueError:
+            return "KR"
+
+    m = {t: mkt(t) for t in cols}
+    out = pd.DataFrame({
+        "주가효과": local.sum().groupby(m).sum(),
+        "환율효과": fxe.sum().groupby(m).sum(),
+    })
+    out["합계"] = out.sum(axis=1)
+    total = result.equity.iloc[-1] - result.equity.iloc[0]
+    out.loc["거래·비용 등"] = [np.nan, np.nan, total - out["합계"].sum()]
+    return out

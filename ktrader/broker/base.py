@@ -41,7 +41,7 @@ class Order:
     side: Side
     qty: int
     order_type: OrderType = OrderType.LIMIT
-    price: int = 0
+    price: float = 0  # 지정가(현지통화). 원화 종목은 정수, 미국 종목은 센트 단위 소수
     reason: str = ""
     client_order_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])  # 멱등성 키
     broker_order_id: str | None = None
@@ -66,6 +66,8 @@ class Fill:
     fee: float
     tax: float
     filled_at: datetime = field(default_factory=now_kst)
+    currency: str = "KRW"
+    fx_rate: float = 1.0      # 체결 시점 환율(외화 1단위당 원화) — 양도소득 원화 환산에 사용
 
 
 @dataclass
@@ -75,10 +77,13 @@ class Position:
     avg_price: float
     last_price: float = 0.0
     name: str = ""
+    currency: str = "KRW"
+    fx_rate: float = 1.0      # 현재 환율. avg_price·last_price는 현지통화
 
     @property
     def market_value(self) -> float:
-        return self.qty * self.last_price
+        """원화 환산 평가금액."""
+        return self.qty * self.last_price * self.fx_rate
 
 
 @dataclass
@@ -91,14 +96,26 @@ class Quote:
     volume: float = 0.0
     status_code: str = "" # 종목 상태(관리·경고·정지 등)
     halted: bool = False
+    currency: str = "KRW"
+    fx_rate: float = 1.0  # 외화 1단위당 원화
+    lot: int = 1          # 매매단위
 
 
 @dataclass
 class AccountSnapshot:
-    cash: float                    # 주문 가능 현금(예수금)
+    cash: float                    # 주문 가능 현금(원화 환산 합계)
     positions: dict[str, Position]
-    total_equity: float
+    total_equity: float            # 원화 환산 총평가금액
     as_of: datetime = field(default_factory=now_kst)
+    cash_by_ccy: dict[str, float] = field(default_factory=dict)  # 통화별 현금(현지통화 금액)
+
+    def exposure(self, key=lambda p: p.currency) -> dict[str, float]:
+        """그룹별(기본: 통화별) 원화 평가금액 합계."""
+        out: dict[str, float] = {}
+        for t, p in self.positions.items():
+            k = key(p) if callable(key) else key
+            out[k] = out.get(k, 0.0) + p.market_value
+        return out
 
 
 class Broker(ABC):

@@ -18,7 +18,8 @@ from datetime import datetime
 
 from ..broker.base import Order, Side
 from ..config import TradingMode
-from ..krx import now_kst, session_phase
+from ..krx import now_kst
+from ..markets import parse_symbol
 
 REAL_MODE_CONFIRM = "I_UNDERSTAND_REAL_MONEY_RISK"
 
@@ -51,7 +52,10 @@ class ComplianceGuard:
             ratio = sum(1 for e in recent if e == "cancel") / len(recent)
             if ratio > self.max_cancel_ratio:
                 issues.append(f"최근 취소 비율 {ratio:.0%} 과다(허수성 호가 오인 소지) → 주문 일시 중단")
-        phase = session_phase(now)
+        try:
+            phase = parse_symbol(order.ticker).spec.session_phase(now)  # 종목 시장의 현지 시각 기준
+        except ValueError:
+            phase = "closed"
         if phase in ("pre_auction", "close_auction") and volume > 0 and order.qty > volume * self.auction_max_participation:
             issues.append("단일가 시간대 대량 주문(시가·종가 관여 오인 소지) → 정규 접속매매 시간에 분할 주문")
         return issues

@@ -29,6 +29,8 @@ class ScreenConfig:
     exclude_suspended: bool = True
     restricted: set[str] = field(default_factory=set)  # 관리종목·투자경고/위험·정리매매 등
     min_factor_coverage: float = 0.7       # 팩터 값의 70% 이상 존재해야 점수 산출
+    standardize_by_market: bool = True     # 시장별로 따로 표준화(시장 간 PER·변동성 수준 차이 제거)
+    markets: set[str] | None = None        # 대상 시장 제한(None이면 전체)
 
 
 @dataclass
@@ -51,7 +53,10 @@ def apply_filters(table: pd.DataFrame, cfg: ScreenConfig) -> tuple[pd.DataFrame,
     mark(table.index.to_series().isin(cfg.restricted), "투자유의·관리 지정 종목")
     if cfg.exclude_suspended and "suspended" in table:
         mark(table["suspended"].astype(bool), "거래정지(최근 거래량 0)")
-    mark(table["price"] < cfg.min_price, f"주가 {cfg.min_price:,.0f}원 미만")
+    if cfg.markets is not None and "market" in table:
+        mark(~table["market"].isin(cfg.markets), "대상 시장 아님")
+    price_krw = table["price_base"] if "price_base" in table else table["price"]
+    mark(price_krw < cfg.min_price, f"주가(원화 환산) {cfg.min_price:,.0f}원 미만")
     if "liquidity" in table:
         mark(table["liquidity"] < cfg.min_liquidity, f"평균 거래대금 {cfg.min_liquidity / 1e8:,.0f}억원 미만")
     return table[reasons == ""], reasons[reasons != ""]
@@ -75,15 +80,22 @@ def score(table: pd.DataFrame, weights: dict[str, float] | None = None, cfg: Scr
 
     out = pd.DataFrame(index=passed.index)
     total_w = sum(abs(w) for w in weights.values())
+    by_mkt = cfg.standardize_by_market and "market" in passed and passed["market"].nunique() > 1
     for f, w in weights.items():
         spec = FACTOR_SPECS[f]
-        z = zscore(winsorize(passed[f].astype(float))) * spec.direction
+        x = passed[f].astype(float)
+        if by_mkt:
+            # 시장 안에서의 상대 순위로 비교: 일본 저PBR·미국 고PER 같은 구조적 차이가 점수를 왜곡하지 않게 함
+            z = x.groupby(passed["market"]).transform(lambda s: zscore(winsorize(s)) if s.notna().sum() >= 3 else s * 0.0)
+        else:
+            z = zscore(winsorize(x))
+        z = z * spec.direction
         out[f"z_{f}"] = z
         # 결측 팩터는 0점(평균) 처리 → 결측이 유리하거나 불리하게 작용하지 않음
         out[f"contrib_{f}"] = z.fillna(0) * (w / total_w)
     out["composite"] = out[[c for c in out if c.startswith("contrib_")]].sum(axis=1)
     out["rank"] = out["composite"].rank(ascending=False, method="first").astype(int)
-    for c in ("price", "liquidity"):
+    for c in ("price", "price_base", "liquidity", "market"):
         if c in passed:
             out[c] = passed[c]
     return ScreenResult(out.sort_values("rank"), excluded, weights)

@@ -9,6 +9,7 @@ import pandas as pd
 
 from ..analysis.factors import FACTOR_SPECS
 from ..backtest.metrics import format_metrics
+from ..markets import MARKETS, parse_symbol
 
 DISCLAIMER = ("※ 본 결과는 과거 데이터와 통계 모델에 근거한 참고 정보이며, 미래 수익을 보장하지 않습니다. "
               "투자 판단과 그 결과에 대한 책임은 투자자 본인에게 있습니다.")
@@ -35,7 +36,8 @@ def explain_recommendation(ticker: str, row: pd.Series, name: str = "", universe
     """
     contribs = {c[len("contrib_"):]: row[c] for c in row.index if c.startswith("contrib_")}
     ranked = sorted(contribs.items(), key=lambda kv: kv[1], reverse=True)
-    head = f"[{ticker} {name}] 종합점수 {row['composite']:+.2f} (순위 {int(row['rank'])}"
+    mk = f" · {MARKETS[row['market']].name_ko}" if "market" in row.index and row["market"] in MARKETS else ""
+    head = f"[{ticker} {name}{mk}] 종합점수 {row['composite']:+.2f} (순위 {int(row['rank'])}"
     head += f"/{universe_size})" if universe_size else ")"
     lines = [head, "  ▶ 선정 근거(기여도 큰 순):"]
     for f, c in ranked[:3]:
@@ -63,7 +65,12 @@ def explain_exclusions(excluded: pd.Series, top: int = 5) -> str:
 
 def explain_order(order, decision=None, signal_reason: str = "") -> str:
     side = "매수" if order.side.value == "buy" else "매도"
-    s = f"{order.ticker} {side} {order.qty:,}주 @ {order.price:,}원 ({order.order_type.value})"
+    try:
+        ccy = parse_symbol(order.ticker).currency
+    except ValueError:
+        ccy = "KRW"
+    unit = "원" if ccy == "KRW" else f" {ccy}"
+    s = f"{order.ticker} {side} {order.qty:,}주 @ {order.price:,}{unit} ({order.order_type.value})"
     if signal_reason or order.reason:
         s += f" — 사유: {signal_reason or order.reason}"
     if decision is not None:

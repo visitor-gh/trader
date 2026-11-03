@@ -158,7 +158,8 @@ class KISBroker(Broker):
                 positions[r["pdno"]] = Position(r["pdno"], qty, float(r["pchs_avg_pric"]), float(r["prpr"]), r.get("prdt_name", ""))
         s = js["output2"][0]
         # 주의: 연속조회(tr_cont, CTX_AREA_*)가 필요한 50종목 이상 계좌는 페이지 반복 구현 필요
-        return AccountSnapshot(cash=float(s["dnca_tot_amt"]), positions=positions, total_equity=float(s["tot_evlu_amt"]))
+        cash = float(s["dnca_tot_amt"])
+        return AccountSnapshot(cash=cash, positions=positions, total_equity=float(s["tot_evlu_amt"]), cash_by_ccy={"KRW": cash})
 
     # ---------------------------------------------------------------- 주문
     def place_order(self, order: Order) -> Order:

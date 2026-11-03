@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ktrader"
-version = "0.1.0"
-description = "국내 주식 데이터 수집·분석·추천·백테스트·자동매매 시스템"
+version = "0.2.0"
+description = "국내·해외 주식 데이터 수집·분석·추천·백테스트·자동매매 시스템"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["pandas>=2.0", "numpy>=1.24", "requests>=2.31", "matplotlib>=3.7", "cryptography>=41"]
 
 [project.optional-dependencies]
-data = ["pykrx", "finance-datareader"]
+data = ["pykrx", "finance-datareader", "yfinance"]
 realtime = ["websockets>=12"]
 secrets = ["keyring>=24"]
 dev = ["pytest>=7"]

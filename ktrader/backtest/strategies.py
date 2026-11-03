@@ -11,9 +11,10 @@ from ..analysis.screener import DEFAULT_WEIGHTS, ScreenConfig, score
 
 
 def _liquid(panel, asof, min_value: float) -> pd.Index:
-    val = panel.get("value", panel["close"] * panel["volume"])
+    val = panel.get("value_base", panel.get("value", panel["close"] * panel["volume"]))  # 원화 환산 우선
     avg = val.loc[:asof].tail(20).mean()
-    alive = panel["volume"].loc[:asof].iloc[-1] > 0
+    vol = panel["volume"].loc[:asof].tail(5)
+    alive = vol.max() > 0          # 최근 5거래일 중 거래 있음(시장별 휴장일과 거래정지 구분)
     return avg[(avg >= min_value) & alive].index
 
 
@@ -31,7 +32,7 @@ class MomentumStrategy:
     name: str = "모멘텀"
 
     def generate_weights(self, asof, panel, fundamentals=None) -> pd.Series:
-        close = panel["close"]
+        close = panel["close"].ffill()
         if self.market_filter:
             idx = (close / close.iloc[0]).mean(axis=1)
             if idx.iloc[-1] < ind.sma(idx, 200).iloc[-1]:
@@ -74,7 +75,7 @@ class RsiMeanReversion:
     name: str = "RSI 역추세"
 
     def generate_weights(self, asof, panel, fundamentals=None) -> pd.Series:
-        close = panel["close"]
+        close = panel["close"].ffill()
         r = ind.rsi(close, self.rsi_n).iloc[-1]
         up = close.iloc[-1] > ind.sma(close, 200).iloc[-1]
         cand = r[(r < self.entry) & up].reindex(_liquid(panel, asof, self.min_value)).dropna()
@@ -105,5 +106,5 @@ class BuyAndHoldEqual:
     name: str = "동일가중 벤치마크"
 
     def generate_weights(self, asof, panel, fundamentals=None) -> pd.Series:
-        alive = panel["close"].loc[:asof].iloc[-1].dropna().index
+        alive = panel["close"].loc[:asof].ffill().iloc[-1].dropna().index
         return pd.Series(1 / len(alive), index=alive)

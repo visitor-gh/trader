@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ..krx import PRICE_LIMIT_RATE
+from ..markets import MARKETS, parse_symbol
 
 SEVERITY_ORDER = {"INFO": 0, "WARN": 1, "ERROR": 2}
 
@@ -67,6 +68,7 @@ def validate_ohlcv(
     calendar: pd.DatetimeIndex | None = None,
     adjusted: bool = True,
     stale_days: int = 5,
+    market: str | None = None,
 ) -> DataQualityReport:
     """일봉 데이터 검증.
 
@@ -104,11 +106,27 @@ def validate_ohlcv(
     # 3) OHLC 논리 일관성: 고가 ≥ max(시가, 종가, 저가), 저가 ≤ min(시가, 종가)
     rep.add("ERROR", "OHLC불일치", "고가<시가/종가 또는 저가>시가/종가", (h < np.maximum(o, c)) | (l > np.minimum(o, c)) | (h < l))
 
-    # 4) 가격제한폭(±30%) 초과 변동 → 수정주가 미반영(액면분할 등) 또는 오류
+    # 4) 가격제한폭 초과 변동 → 수정주가 미반영(액면분할 등) 또는 오류
     ret = c.pct_change()
-    limit_break = ret.abs() > PRICE_LIMIT_RATE + 0.005
-    sev = "ERROR" if adjusted else "WARN"
-    rep.add(sev, "가격제한폭초과", "일간 변동률 ±30% 초과(분할·병합 미보정 또는 신규상장일 의심)", limit_break.fillna(False))
+    if market is None:
+        try:
+            market = parse_symbol(ticker).market
+        except ValueError:
+            market = "KR"
+    limit = MARKETS[market].price_limit if market in MARKETS else PRICE_LIMIT_RATE
+    if limit is not None:
+        limit_break = ret.abs() > limit + 0.005
+        sev = "ERROR" if adjusted else "WARN"
+        rep.add(sev, "가격제한폭초과", f"일간 변동률 ±{limit:.0%} 초과(분할·병합 미보정 또는 신규상장일 의심)", limit_break.fillna(False))
+    else:
+        # 가격제한폭이 없는 시장(미국·일본·홍콩): 실제 급등락이 가능하므로 경고로만 표시
+        # 정확히 1/2, 1/3, 1/4 … 또는 2배·3배 근처의 급변은 분할·병합 미반영 가능성이 높다
+        ratio = (c / c.shift(1)).dropna()
+        near_split = ratio.apply(lambda r: any(abs(r / k - 1) < 0.08 for k in (0.5, 1 / 3, 0.25, 0.2, 0.1, 2, 3, 4, 5, 10)))  # 분할비율 ± 일반적 하루 변동
+        rep.add("ERROR" if adjusted else "WARN", "분할의심", "분할·병합 비율(1/2, 1/3, 2배 등)과 일치하는 하루 변동",
+                near_split.reindex(c.index, fill_value=False))
+        rep.add("WARN", "급등락", "일간 변동률 ±50% 초과(가격제한 없는 시장, 이벤트·오류 확인)",
+                (ret.abs() > 0.5).fillna(False) & ~near_split.reindex(c.index, fill_value=False))
 
     # 5) 거래정지 의심: 거래량 0
     rep.add("WARN", "거래량0", "거래량 0(거래정지·매매거래중단 가능)", v == 0)
@@ -148,7 +166,14 @@ def validate_fundamentals(df: pd.DataFrame) -> DataQualityReport:
             rep.add("WARN", f"{col}극단값", f"{col} > 1000", df[col] > 1000)
     if "market_cap" in df.columns:
         rep.add("ERROR", "시가총액비양수", "시가총액 ≤ 0", df["market_cap"] <= 0)
-    rep.add("ERROR", "종목코드형식", "6자리 코드 아님", pd.Series(~df.index.astype(str).str.fullmatch(r"[0-9A-Z]{6}"), index=df.index))
+    def bad_symbol(x):
+        try:
+            parse_symbol(str(x))
+            return False
+        except ValueError:
+            return True
+    rep.add("ERROR", "종목코드형식", "해석 불가 종목 표기(예: 005930, AAPL, 7203.T, 0700.HK)",
+            pd.Series([bad_symbol(x) for x in df.index], index=df.index))
     return rep
 
 

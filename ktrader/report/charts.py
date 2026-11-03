@@ -34,7 +34,9 @@ def L(ko: str, en: str) -> str:
 
 
 _EN_NAMES = {"모멘텀": "Momentum", "가치": "Value", "멀티팩터": "Multi-factor",
-             "RSI 역추세": "RSI mean-reversion", "동일가중 벤치마크": "Equal-weight benchmark"}
+             "RSI 역추세": "RSI mean-reversion", "동일가중 벤치마크": "Equal-weight benchmark",
+             "국내 멀티팩터": "KR multi-factor", "글로벌 멀티팩터": "Global multi-factor",
+             "글로벌 동일가중": "Global equal-weight"}
 
 
 def plot_equity(results: dict[str, pd.Series], path: str) -> str:

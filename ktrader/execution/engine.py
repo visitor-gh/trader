@@ -21,7 +21,8 @@ from typing import Callable
 import pandas as pd
 
 from ..broker.base import AccountSnapshot, Broker, Order, OrderStatus, OrderType, Side
-from ..krx import now_kst, price_limits, round_to_tick, session_phase
+from ..krx import now_kst
+from ..markets import MARKETS, parse_symbol
 from ..ledger.store import Ledger
 from ..report.explain import explain_order
 from ..risk.manager import RiskManager
@@ -55,36 +56,47 @@ class TradingEngine:
         self.compliance = compliance or ComplianceGuard()
         self.clock = clock
         self.reconcile_enabled = reconcile
+        self.holidays: dict[str, set] = {}   # 시장별 휴장일 {"US": {date(...)}, ...}
         self.open_orders: dict[str, Order] = {}
         self._by_broker_id: dict[str, str] = {}
         self._stop = False
 
     # ------------------------------------------------------------ 가격·수량
-    def limit_price(self, side: Side, price: float, base_price: float) -> int:
-        """시장성 지정가: 매수는 현재가보다 약간 높게(올림), 매도는 약간 낮게(내림) + 상·하한가 제한."""
-        lo, hi = price_limits(base_price)
+    def limit_price(self, side: Side, price: float, base_price: float, ticker: str = "005930") -> float:
+        """시장성 지정가: 매수는 현재가보다 약간 높게(올림), 매도는 약간 낮게(내림) + 가격제한폭 이내.
+        호가단위·가격제한폭은 종목이 속한 시장 규칙(markets.MARKETS)을 따른다."""
+        spec = parse_symbol(ticker).spec
+        lo, hi = spec.price_limits(base_price)
         if side == Side.BUY:
-            return int(min(round_to_tick(price * (1 + self.cfg.limit_offset), "sell"), hi))
-        return int(max(round_to_tick(price * (1 - self.cfg.limit_offset), "buy"), lo))
+            return min(spec.round_price(price * (1 + self.cfg.limit_offset), "sell"), spec.round_price(hi, "buy") if hi != float("inf") else float("inf"))
+        return max(spec.round_price(price * (1 - self.cfg.limit_offset), "buy"), lo)
+
+    def open_markets(self) -> set[str]:
+        """현재 연속매매 중인 시장 코드 집합(시장별 현지 시각·서머타임·점심휴장 반영)."""
+        now = self.clock()
+        return {m for m, spec in MARKETS.items() if spec.session_phase(now, self.holidays.get(m)) == "continuous"}
+
+    def _tradable(self, ticker: str, open_mkts: set[str]) -> bool:
+        return self.cfg.allow_outside_session or parse_symbol(ticker).market in open_mkts
 
     def build_orders(self, targets: pd.Series, account: AccountSnapshot, reasons: dict[str, str]) -> list[Order]:
         eq = account.total_equity
         orders = []
-        tickers = set(targets.index) | set(account.positions)
+        tickers = sorted(set(targets.index) | set(account.positions))  # 결정적 순서(재현 가능한 로그)
         for t in tickers:
             w = float(targets.get(t, 0.0))
             q = self.broker.get_quote(t)
             cur_qty = account.positions[t].qty if t in account.positions else 0
-            cur_w = cur_qty * q.price / eq if eq else 0
+            cur_w = cur_qty * q.price * q.fx_rate / eq if eq else 0   # 원화 환산 비중
             if abs(w - cur_w) < self.cfg.rebalance_tolerance and w > 0:
                 continue
-            tgt_qty = self.risk.size_position(eq, q.price, target_weight=w) if w > 0 else 0
+            tgt_qty = self.risk.size_position(eq, q.price, target_weight=w, fx_rate=q.fx_rate, lot=q.lot) if w > 0 else 0
             dq = tgt_qty - cur_qty
-            if dq == 0 or abs(dq) * q.price < self.cfg.min_trade_value and tgt_qty != 0:
+            if dq == 0 or abs(dq) * q.price * q.fx_rate < self.cfg.min_trade_value and tgt_qty != 0:
                 continue
             side = Side.BUY if dq > 0 else Side.SELL
             why = reasons.get(t, "목표 비중 조정") if dq > 0 else ("편출(목표에서 제외)" if w == 0 else "비중 축소")
-            orders.append(Order(t, side, abs(dq), OrderType.LIMIT, self.limit_price(side, q.price, q.base_price), why))
+            orders.append(Order(t, side, abs(dq), OrderType.LIMIT, self.limit_price(side, q.price, q.base_price, t), why))
         orders.sort(key=lambda o: 0 if o.side == Side.SELL else 1)  # 매도 먼저 → 현금 확보
         return orders
 
@@ -164,9 +176,9 @@ class TradingEngine:
 
     # ------------------------------------------------------------ 사이클
     def run_cycle(self) -> dict:
-        phase = session_phase(self.clock())
-        if phase != "continuous" and not self.cfg.allow_outside_session:
-            return {"status": "skip", "reason": f"장 구분 {phase}: 신규 주문 없음"}
+        open_mkts = self.open_markets()
+        if not open_mkts and not self.cfg.allow_outside_session:
+            return {"status": "skip", "reason": "연속매매 중인 시장 없음: 신규 주문 없음"}
 
         self.collect_fills()
         acct = self.broker.get_account()
@@ -180,12 +192,13 @@ class TradingEngine:
 
         submitted = []
         # 손절 우선
-        prices = {t: self.broker.get_quote(t).price for t in acct.positions}
-        exits = self.risk.check_exits(acct, prices)
+        prices = {t: self.broker.get_quote(t).price for t in acct.positions if self._tradable(t, open_mkts)}
+        exits = [e for e in self.risk.check_exits(acct, prices) if e.ticker in prices]
         exit_tickers = set()
         for ex in exits:
             q = self.broker.get_quote(ex.ticker)
-            o = Order(ex.ticker, Side.SELL, ex.qty, OrderType.LIMIT, self.limit_price(Side.SELL, q.price, q.base_price), ex.reason)
+            o = Order(ex.ticker, Side.SELL, ex.qty, OrderType.LIMIT,
+                      self.limit_price(Side.SELL, q.price, q.base_price, ex.ticker), ex.reason)
             submitted.append(self.submit(o, acct))
             exit_tickers.add(ex.ticker)
 
@@ -194,7 +207,11 @@ class TradingEngine:
         for t, r in reasons.items():
             if t in targets.index:
                 self.ledger.record_signal(t, float(targets[t]), 0.0, r)
-        for o in self.build_orders(targets, acct, reasons):
+        # 지금 열려 있는 시장의 종목만 주문. 닫힌 시장의 리밸런싱은 그 시장이 열리는 다음 사이클에서 처리
+        live = targets[[self._tradable(t, open_mkts) for t in targets.index]]
+        held_open = {t: p for t, p in acct.positions.items() if self._tradable(t, open_mkts)}
+        acct_open = AccountSnapshot(acct.cash, held_open, acct.total_equity, acct.as_of, acct.cash_by_ccy)
+        for o in self.build_orders(live, acct_open, reasons):
             if o.ticker in exit_tickers:
                 continue
             submitted.append(self.submit(o, self.broker.get_account()))

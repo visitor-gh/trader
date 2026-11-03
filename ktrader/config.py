@@ -25,17 +25,36 @@ class CostModel:
                       2026년 시행 기준 KOSPI·KOSDAQ 모두 0.20%로 설정했다.
                       세법 개정 시 반드시 갱신한다.
     slippage_bps    : 슬리피지(예상 체결가와 실제 체결가의 차이), 1bp = 0.01%.
+    buy_tax_rate    : 매수 시 부과 세금(예: 홍콩 인지세 0.1%).
+    fx_spread       : 환전 스프레드(해외주식 매수 시 원화→외화, 매도 시 외화→원화 환전 비용).
+                      증권사 환율우대에 따라 크게 달라진다.
     """
 
     commission_rate: float = 0.00015
     sell_tax_rate: float = 0.0020
     slippage_bps: float = 10.0
+    buy_tax_rate: float = 0.0
+    fx_spread: float = 0.0
 
     def buy_cost(self, notional: float) -> float:
-        return notional * self.commission_rate
+        return notional * (self.commission_rate + self.buy_tax_rate + self.fx_spread)
 
     def sell_cost(self, notional: float) -> float:
-        return notional * (self.commission_rate + self.sell_tax_rate)
+        return notional * (self.commission_rate + self.sell_tax_rate + self.fx_spread)
+
+
+# 시장별 거래비용(기본값). 수수료는 증권사·이벤트·등급별로 다르고 세율·규제수수료는 수시로 바뀌므로
+# 반드시 본인 계약 조건과 최신 고시로 덮어쓴다.
+MARKET_COSTS: dict[str, CostModel] = {
+    "KR": CostModel(),
+    # 미국: 온라인 수수료 0.25% 가정, 매도 시 SEC fee·FINRA TAF(소액, 수시 변경) 보수적 근사, 환전 스프레드 0.25%
+    "US": CostModel(commission_rate=0.0025, sell_tax_rate=0.00003, slippage_bps=5.0, fx_spread=0.0025),
+    # 일본: 수수료 0.25% 가정, 거래세 없음
+    "JP": CostModel(commission_rate=0.0025, sell_tax_rate=0.0, slippage_bps=10.0, fx_spread=0.0025),
+    # 홍콩: 인지세 매수·매도 각 0.1% + 거래소·감독기관 수수료 약 0.0086%
+    "HK": CostModel(commission_rate=0.0025, sell_tax_rate=0.001086, slippage_bps=15.0,
+                    buy_tax_rate=0.001086, fx_spread=0.0025),
+}
 
 
 @dataclass(frozen=True)
@@ -57,6 +76,9 @@ class RiskConfig:
     duplicate_order_window_sec: int = 60    # 같은 종목·같은 방향 중복 주문 차단 시간
     min_avg_trading_value: float = 1_000_000_000  # 20일 평균 거래대금 하한(원) — 유동성 필터
     max_participation: float = 0.05         # 일 거래량 대비 최대 주문 비율
+    max_foreign_weight: float = 0.70        # 외화자산(원화 외 통화) 합계 비중 한도 → 환율 위험 제한
+    max_market_weight: dict = field(default_factory=lambda: {"KR": 1.0, "US": 0.6, "JP": 0.3, "HK": 0.2})
+    auto_fx: bool = True                    # 통합증거금(원화로 외화주식 매수 시 자동 환전) 사용 여부
 
 
 @dataclass(frozen=True)

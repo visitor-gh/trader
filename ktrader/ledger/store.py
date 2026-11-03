@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE TABLE IF NOT EXISTS fills (
   id INTEGER PRIMARY KEY AUTOINCREMENT, client_order_id TEXT, ticker TEXT, side TEXT,
-  qty INTEGER, price REAL, fee REAL, tax REAL, filled_at TEXT
+  qty INTEGER, price REAL, fee REAL, tax REAL, filled_at TEXT, currency TEXT DEFAULT 'KRW', fx_rate REAL DEFAULT 1.0
 );
 CREATE TABLE IF NOT EXISTS equity (
   ts TEXT PRIMARY KEY, cash REAL, market_value REAL, total_equity REAL, n_positions INTEGER
@@ -46,8 +46,17 @@ class Ledger:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.executescript(SCHEMA)
+        self._migrate()
         if path != ":memory:":
             os.chmod(path, 0o600)  # 소유자만 읽기/쓰기
+
+    def _migrate(self) -> None:
+        """구버전 DB(국내 전용)에 통화·환율 컬럼 추가. 기존 행은 KRW, 환율 1.0으로 간주."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(fills)")}
+        for name, ddl in (("currency", "TEXT DEFAULT 'KRW'"), ("fx_rate", "REAL DEFAULT 1.0")):
+            if name not in cols:
+                self.db.execute(f"ALTER TABLE fills ADD COLUMN {name} {ddl}")
+        self.db.commit()
 
     # ------------------------------------------------------------ 감사로그
     def log_event(self, event: str, payload: dict) -> str:
@@ -88,10 +97,13 @@ class Ledger:
                                  "price": o.price, "status": o.status.value, "risk": risk_note})
 
     def record_fill(self, f: Fill) -> None:
-        self.db.execute("INSERT INTO fills(client_order_id, ticker, side, qty, price, fee, tax, filled_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (f.client_order_id, f.ticker, f.side.value, f.qty, f.price, f.fee, f.tax, f.filled_at.isoformat()))
+        self.db.execute("INSERT INTO fills(client_order_id, ticker, side, qty, price, fee, tax, filled_at, currency, fx_rate) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (f.client_order_id, f.ticker, f.side.value, f.qty, f.price, f.fee, f.tax, f.filled_at.isoformat(),
+                         f.currency, f.fx_rate))
         self.db.commit()
-        self.log_event("fill", {"id": f.client_order_id, "ticker": f.ticker, "side": f.side.value, "qty": f.qty, "price": f.price})
+        self.log_event("fill", {"id": f.client_order_id, "ticker": f.ticker, "side": f.side.value, "qty": f.qty,
+                                "price": f.price, "ccy": f.currency, "fx": f.fx_rate})
 
     def record_equity(self, cash: float, market_value: float, n_positions: int, ts: datetime | None = None) -> None:
         ts = (ts or now_kst()).isoformat()
@@ -114,15 +126,26 @@ class Ledger:
         return {t: int(q) for t, q in rows if q}
 
     def realized_pnl(self) -> pd.DataFrame:
-        """종목별 실현손익(평균단가법, 비용 차감)."""
+        """종목별 실현손익(원화, 평균단가법, 비용 차감)."""
+        t = self.realized_trades()
+        return t.groupby(["ticker", "currency"], as_index=False)["realized_pnl"].sum()
+
+    def realized_trades(self) -> pd.DataFrame:
+        """매도 체결 단위 실현손익(원화) — 세금 계산용.
+        price는 현지통화, fee·tax는 원화로 기록되므로 매수가·매도가를 각 체결 시점 환율로 원화 환산한다.
+        (세법상 양도·취득가액은 각 결제일 기준환율로 환산 — 운영 시 결제일 환율로 교체 가능)
+        """
         f = self.df("SELECT * FROM fills ORDER BY id")
-        out, held, avg = {}, {}, {}
+        rows, held, avg = [], {}, {}
         for r in f.itertuples():
+            fx = getattr(r, "fx_rate", 1.0) or 1.0
+            px_krw = r.price * fx
             if r.side == "buy":
                 q0 = held.get(r.ticker, 0)
-                avg[r.ticker] = (avg.get(r.ticker, 0) * q0 + r.price * r.qty + r.fee) / (q0 + r.qty)
+                avg[r.ticker] = (avg.get(r.ticker, 0) * q0 + px_krw * r.qty + r.fee + r.tax) / (q0 + r.qty)
                 held[r.ticker] = q0 + r.qty
             else:
-                out[r.ticker] = out.get(r.ticker, 0) + (r.price - avg.get(r.ticker, r.price)) * r.qty - r.fee - r.tax
+                rows.append({"ticker": r.ticker, "currency": r.currency, "filled_at": r.filled_at,
+                             "realized_pnl": (px_krw - avg.get(r.ticker, px_krw)) * r.qty - r.fee - r.tax})
                 held[r.ticker] = held.get(r.ticker, 0) - r.qty
-        return pd.Series(out, name="realized_pnl").rename_axis("ticker").reset_index()
+        return pd.DataFrame(rows, columns=["ticker", "currency", "filled_at", "realized_pnl"])
